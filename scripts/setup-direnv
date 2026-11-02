@@ -23,38 +23,56 @@ else
   ARCH_DIR="darwin"
 fi
 
+if [[ ! -f "$SITES_JSON" ]]; then
+  echo "Error: Local by Flywheel sites file not found at $SITES_JSON." >&2
+  echo "Install Local and create at least one site, then try again." >&2
+  exit 1
+fi
+
 # ── Helpers ──────────────────────────────────────────────────────────
+# Values are passed to Python as argv, never spliced into the source,
+# so site names containing quotes or glob characters are handled safely.
 
-get_sites_json() {
+get_sites_tsv() {
   local filter="${1:-}"
-  python3 -c "
-import json, os, sys
+  python3 - "$SITES_JSON" "$filter" <<'PY'
+import json, sys
 
-sites_path = os.path.expanduser('$SITES_JSON')
+sites_path, filter_name = sys.argv[1], sys.argv[2]
 with open(sites_path) as f:
     sites = json.load(f)
 
-filter_name = '$filter'
+if filter_name and not any(s['name'] == filter_name for s in sites.values()):
+    print(f'Error: Site "{filter_name}" not found.', file=sys.stderr)
+    sys.exit(1)
+
 for s in sorted(sites.values(), key=lambda x: x['name']):
     if filter_name and s['name'] != filter_name:
         continue
-    php_ver = s['services']['php']['version']
-    mysql_ver = s['services']['mysql']['version']
-    print(f\"{s['id']}|{s['name']}|{s['path']}|{php_ver}|{mysql_ver}\")
+    print("\t".join([
+        s['id'],
+        s['name'],
+        s['path'],
+        s['services']['php']['version'],
+        s['services']['mysql']['version'],
+        s['services']['mysql'].get('name', 'mysql'),
+    ]))
+PY
+}
 
-if filter_name:
-    # Check if we found the site
-    found = any(s['name'] == filter_name for s in sites.values())
-    if not found:
-        print(f'Error: Site \"{filter_name}\" not found.', file=sys.stderr)
-        sys.exit(1)
-"
+# Print the newest installed lightning-services folder for a component.
+# Local names folders "<component>-<version>+<build>"; the "+" anchors the
+# version so "8.2.2" cannot match "8.2.27+1".
+find_service() {
+  local component="$1"
+  local version="$2"
+  # "|| true": a missing folder should reach the friendly error, not exit silently.
+  find "$LOCAL_BASE/lightning-services" -maxdepth 1 -type d -name "${component}-${version}+*" 2>/dev/null | sort | tail -1 || true
 }
 
 resolve_php_bin() {
-  local php_ver="$1"
   local php_base
-  php_base=$(find "$LOCAL_BASE/lightning-services" -maxdepth 1 -type d -name "php-${php_ver}*" | head -1)
+  php_base=$(find_service php "$1")
   if [[ -z "$php_base" ]]; then
     echo ""
     return
@@ -63,9 +81,8 @@ resolve_php_bin() {
 }
 
 resolve_mysql_bin_dir() {
-  local mysql_ver="$1"
   local mysql_base
-  mysql_base=$(find "$LOCAL_BASE/lightning-services" -maxdepth 1 -type d -name "mysql-${mysql_ver}*" | head -1)
+  mysql_base=$(find_service "$2" "$1")
   if [[ -z "$mysql_base" ]]; then
     echo ""
     return
@@ -79,6 +96,7 @@ generate_envrc() {
   local site_path="$3"
   local php_ver="$4"
   local mysql_ver="$5"
+  local db_engine="$6"
 
   local php_bin
   php_bin=$(resolve_php_bin "$php_ver")
@@ -88,9 +106,9 @@ generate_envrc() {
   fi
 
   local mysql_bin_dir
-  mysql_bin_dir=$(resolve_mysql_bin_dir "$mysql_ver")
+  mysql_bin_dir=$(resolve_mysql_bin_dir "$mysql_ver" "$db_engine")
   if [[ -z "$mysql_bin_dir" ]]; then
-    echo "  ⚠  Skipping $site_name: MySQL $mysql_ver not found in lightning-services"
+    echo "  ⚠  Skipping $site_name: $db_engine $mysql_ver not found in lightning-services"
     return 1
   fi
 
@@ -141,11 +159,17 @@ ENVRC
 if [[ "${1:-}" == "--list" ]]; then
   echo "Sites that would receive .envrc files:"
   echo ""
-  get_sites_json | while IFS='|' read -r id name path php_ver mysql_ver; do
+  while IFS=$'\t' read -r id name path php_ver mysql_ver db_engine; do
     echo "  $name → $path/.envrc"
-  done
+  done < <(get_sites_tsv)
   exit 0
 fi
+
+FILTER="${1:-}"
+
+# Resolve the site list first so an unknown name fails before anything else
+# is printed (a failing process substitution would not stop the script).
+SITES="$(get_sites_tsv "$FILTER")" || exit 1
 
 # Check direnv is installed
 if ! command -v direnv &>/dev/null; then
@@ -160,21 +184,24 @@ if ! command -v direnv &>/dev/null; then
   echo ""
 fi
 
-FILTER="${1:-}"
 GENERATED=0
 SKIPPED=0
 
 echo "Generating .envrc files for Local sites..."
 echo ""
 
-get_sites_json "$FILTER" | while IFS='|' read -r id name path php_ver mysql_ver; do
-  if generate_envrc "$id" "$name" "$path" "$php_ver" "$mysql_ver"; then
+# A here-string (not a pipe) keeps the counters in this shell.
+while IFS=$'\t' read -r id name path php_ver mysql_ver db_engine; do
+  [[ -n "$id" ]] || continue
+  if generate_envrc "$id" "$name" "$path" "$php_ver" "$mysql_ver" "$db_engine"; then
     GENERATED=$((GENERATED + 1))
   else
     SKIPPED=$((SKIPPED + 1))
   fi
-done
+done <<< "$SITES"
 
+echo ""
+echo "Generated: $GENERATED | Skipped: $SKIPPED"
 echo ""
 echo "Done. To activate, cd into a site directory and run:"
 echo "  direnv allow"

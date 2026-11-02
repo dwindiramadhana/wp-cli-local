@@ -21,24 +21,31 @@ Auto-detects the target site from your working directory, resolves the correct P
 
 ## Install
 
-### Step 1 — Clone
+### Option A — Installer (recommended)
+
+Unzip the package, open Terminal in the unzipped folder, and run:
+
+```bash
+bash install.sh
+```
+
+The installer checks your requirements, copies the skill to `~/.claude/skills/wp-cli-local`, and links the wrapper as `~/bin/local-wp`. It does not use sudo. If `~/bin` is not on your PATH, it prints the one line to add to your shell config.
+
+If `~/.claude/skills/wp-cli-local` already exists, the installer keeps that copy. To update, replace the folder with the new package.
+
+### Option B — Git clone
 
 ```bash
 git clone https://github.com/dwindiramadhana/wp-cli-local.git ~/.claude/skills/wp-cli-local
-```
-
-### Step 2 — Symlink into PATH (recommended)
-
-This makes the wrapper available as `local-wp` from any terminal or AI agent:
-
-```bash
 chmod +x ~/.claude/skills/wp-cli-local/scripts/wp
-ln -s ~/.claude/skills/wp-cli-local/scripts/wp /usr/local/bin/local-wp
+mkdir -p ~/bin && ln -sfn ~/.claude/skills/wp-cli-local/scripts/wp ~/bin/local-wp
 ```
 
-Now any tool can run `local-wp plugin list` like a normal CLI command.
+### Make `local-wp` available everywhere (optional)
 
-### Step 3 (optional) — Add AGENTS.md to your project
+Once the symlink exists, any tool can run `local-wp plugin list` like a normal CLI command.
+
+### Add AGENTS.md to your project (optional)
 
 Copy the included `AGENTS.md` into your project root so any AI coding agent (Codex, Cursor, etc.) knows to use the wrapper:
 
@@ -122,6 +129,20 @@ $WP -s my plugin list
 
 # List all sites
 $WP --list
+```
+
+## Limitations
+
+- macOS only. The wrapper reads Local's own files (`sites.json`, `lightning-services`, `run/<site-id>/conf`). These are not a documented API, so a future Local update could change them.
+- Tested with MySQL-based Local sites. MariaDB sites have not been tested; if the database binaries are missing the wrapper says so instead of failing silently.
+- The target site should be running in Local, because its `php.ini` only exists while it runs.
+
+## Tests
+
+The test suite builds a fake Local layout in a temporary folder, so it needs no Local install and does not touch your real sites:
+
+```bash
+bash tests/test.sh
 ```
 
 ## License

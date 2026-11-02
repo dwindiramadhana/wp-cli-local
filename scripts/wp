@@ -31,14 +31,21 @@ if [[ -z "$WP_CLI_BIN" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$SITES_JSON" ]]; then
+  echo "Error: Local by Flywheel sites file not found at $SITES_JSON." >&2
+  echo "Install Local and create at least one site, then try again." >&2
+  exit 1
+fi
+
 # ── Helpers ──────────────────────────────────────────────────────────
+# Values are passed to Python as argv/env, never spliced into the source,
+# so site names containing quotes or glob characters are handled safely.
 
 list_sites() {
-  python3 -c "
+  python3 - "$SITES_JSON" "$STATUSES_JSON" <<'PY'
 import json, os, sys
 
-sites_path = os.path.expanduser('$SITES_JSON')
-statuses_path = os.path.expanduser('$STATUSES_JSON')
+sites_path, statuses_path = sys.argv[1], sys.argv[2]
 
 with open(sites_path) as f:
     sites = json.load(f)
@@ -51,87 +58,84 @@ if os.path.exists(statuses_path):
 for s in sorted(sites.values(), key=lambda x: x['name']):
     status = statuses.get(s['id'], 'unknown')
     marker = '●' if status == 'running' else '○'
-    print(f'  {marker} {s[\"name\"]:20s} {status:10s} {s[\"path\"]}')
-"
+    print(f"  {marker} {s['name']:20s} {status:10s} {s['path']}")
+PY
 }
 
-# Auto-detect site from CWD: find the site whose path is the longest
-# prefix of the current directory.
-auto_detect_site() {
-  python3 -c "
-import json, os, sys
+# Resolve a site and print one tab-separated line:
+#   id <TAB> name <TAB> path <TAB> php_version <TAB> db_version <TAB> db_engine
+# Mode "cwd": longest sites.json path that contains the current directory.
+# Mode "name": exact name match, else a single case-insensitive substring match.
+resolve_site() {
+  local mode="$1"
+  local query="${2:-}"
+  python3 - "$SITES_JSON" "$mode" "$query" "$PWD" <<'PY'
+import json, sys
 
-cwd = os.getcwd()
-sites_path = os.path.expanduser('$SITES_JSON')
-
-with open(sites_path) as f:
-    sites = json.load(f)
-
-best = None
-best_len = 0
-for s in sites.values():
-    p = s['path'].rstrip('/')
-    # CWD must equal the site path or be a subdirectory of it
-    if cwd == p or cwd.startswith(p + '/'):
-        if len(p) > best_len:
-            best = s
-            best_len = len(p)
-
-if best is None:
-    sys.exit(1)
-
-php_ver = best['services']['php']['version']
-mysql_ver = best['services']['mysql']['version']
-print(f\"{best['id']}|{best['name']}|{best['path']}|{php_ver}|{mysql_ver}\")
-"
-}
-
-lookup_site_by_name() {
-  local name="$1"
-  python3 -c "
-import json, os, sys
-
-sites_path = os.path.expanduser('$SITES_JSON')
+sites_path, mode, query, cwd = sys.argv[1:5]
 
 with open(sites_path) as f:
-    sites = json.load(f)
+    sites = list(json.load(f).values())
 
-# First try exact match
-for s in sites.values():
-    if s['name'] == '$name':
-        php_ver = s['services']['php']['version']
-        mysql_ver = s['services']['mysql']['version']
-        print(f\"{s['id']}|{s['name']}|{s['path']}|{php_ver}|{mysql_ver}\")
-        sys.exit(0)
+def emit(s):
+    print("\t".join([
+        s['id'],
+        s['name'],
+        s['path'],
+        s['services']['php']['version'],
+        s['services']['mysql']['version'],
+        # Service name Local recorded (e.g. "mysql"); used to pick the folder.
+        s['services']['mysql'].get('name', 'mysql'),
+    ]))
 
-# Then try fuzzy match (partial, case-insensitive)
-import fnmatch
-pattern = '*$name*'
-matches = [s for s in sites.values() if fnmatch.fnmatch(s['name'].lower(), pattern.lower())]
-
-if len(matches) == 1:
-    s = matches[0]
-    php_ver = s['services']['php']['version']
-    mysql_ver = s['services']['mysql']['version']
-    print(f\"{s['id']}|{s['name']}|{s['path']}|{php_ver}|{mysql_ver}\")
+if mode == "cwd":
+    best, best_len = None, 0
+    for s in sites:
+        p = s['path'].rstrip('/')
+        # CWD must equal the site path or be a subdirectory of it
+        if (cwd == p or cwd.startswith(p + '/')) and len(p) > best_len:
+            best, best_len = s, len(p)
+    if best is None:
+        sys.exit(1)
+    emit(best)
     sys.exit(0)
-elif len(matches) > 1:
-    print(f'Ambiguous match for \"$name\". Did you mean:', file=sys.stderr)
-    for m in matches:
-        print(f'  - {m[\"name\"]}', file=sys.stderr)
-    sys.exit(1)
 
+exact = [s for s in sites if s['name'] == query]
+if exact:
+    emit(exact[0])
+    sys.exit(0)
+
+needle = query.lower()
+matches = [s for s in sites if needle in s['name'].lower()]
+if len(matches) == 1:
+    emit(matches[0])
+    sys.exit(0)
+if len(matches) > 1:
+    print(f'Ambiguous match for "{query}". Did you mean:', file=sys.stderr)
+    for m in matches:
+        print(f"  - {m['name']}", file=sys.stderr)
 sys.exit(1)
-"
+PY
+}
+
+# Print the newest installed lightning-services folder for a component,
+# e.g. find_service php 8.3.23 -> .../php-8.3.23+0
+# Local names folders "<component>-<version>+<build>", so the "+" anchors the
+# version and "8.2.2" can no longer match "8.2.27+1".
+find_service() {
+  local component="$1"
+  local version="$2"
+  # "|| true": a missing folder should reach the friendly error, not exit silently.
+  find "$LOCAL_BASE/lightning-services" -maxdepth 1 -type d -name "${component}-${version}+*" 2>/dev/null | sort | tail -1 || true
 }
 
 check_site_status() {
   local site_id="$1"
   local site_name="$2"
-  python3 -c "
+  python3 - "$STATUSES_JSON" "$site_id" "$site_name" <<'PY'
 import json, os, sys
 
-statuses_path = os.path.expanduser('$STATUSES_JSON')
+statuses_path, site_id, site_name = sys.argv[1:4]
 
 if not os.path.exists(statuses_path):
     sys.exit(0)
@@ -139,16 +143,15 @@ if not os.path.exists(statuses_path):
 with open(statuses_path) as f:
     statuses = json.load(f)
 
-status = statuses.get('$site_id', 'unknown')
+status = statuses.get(site_id, 'unknown')
 if status != 'running':
-    print(f'Warning: Site \"$site_name\" is {status}. It may need to be started in Local.', file=sys.stderr)
-"
+    print(f'Warning: Site "{site_name}" is {status}. It may need to be started in Local.', file=sys.stderr)
+PY
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────
 
 SITE_NAME=""
-PASSTHROUGH_ARGS=()
 
 # Handle --list
 if [[ "${1:-}" == "--list" ]]; then
@@ -179,7 +182,7 @@ fi
 SITE_INFO=""
 
 if [[ -n "$SITE_NAME" ]]; then
-  SITE_INFO=$(lookup_site_by_name "$SITE_NAME") || {
+  SITE_INFO=$(resolve_site name "$SITE_NAME") || {
     echo "Error: Site '$SITE_NAME' not found in Local by Flywheel." >&2
     echo "" >&2
     echo "Available sites:" >&2
@@ -187,7 +190,7 @@ if [[ -n "$SITE_NAME" ]]; then
     exit 1
   }
 else
-  SITE_INFO=$(auto_detect_site 2>/dev/null) || true
+  SITE_INFO=$(resolve_site cwd 2>/dev/null) || true
 
   if [[ -z "$SITE_INFO" ]]; then
     if [[ $# -eq 0 ]]; then
@@ -211,7 +214,7 @@ else
   fi
 fi
 
-IFS='|' read -r SITE_ID SITE_NAME SITE_PATH PHP_VER MYSQL_VER <<< "$SITE_INFO"
+IFS=$'\t' read -r SITE_ID SITE_NAME SITE_PATH PHP_VER MYSQL_VER DB_ENGINE <<< "$SITE_INFO"
 
 # Expand ~ in site path
 SITE_PATH="${SITE_PATH/#\~/$HOME}"
@@ -224,21 +227,30 @@ check_site_status "$SITE_ID" "$SITE_NAME"
 
 # ── Resolve PHP binary ───────────────────────────────────────────────
 
-PHP_BASE=$(find "$LOCAL_BASE/lightning-services" -maxdepth 1 -type d -name "php-${PHP_VER}*" | head -1)
+PHP_BASE=$(find_service php "$PHP_VER")
 if [[ -z "$PHP_BASE" ]]; then
   echo "Error: Could not find PHP $PHP_VER in Local lightning-services." >&2
   exit 1
 fi
 PHP_BIN="$PHP_BASE/bin/$ARCH_DIR/bin/php"
+if [[ ! -x "$PHP_BIN" ]]; then
+  echo "Error: PHP binary not found or not executable at $PHP_BIN" >&2
+  exit 1
+fi
 
-# ── Resolve MySQL binary directory ────────────────────────────────────
+# ── Resolve MySQL/MariaDB binary directory ────────────────────────────
 
-MYSQL_BASE=$(find "$LOCAL_BASE/lightning-services" -maxdepth 1 -type d -name "mysql-${MYSQL_VER}*" | head -1)
+MYSQL_BASE=$(find_service "$DB_ENGINE" "$MYSQL_VER")
 if [[ -z "$MYSQL_BASE" ]]; then
-  echo "Error: Could not find MySQL $MYSQL_VER in Local lightning-services." >&2
+  echo "Error: Could not find $DB_ENGINE $MYSQL_VER in Local lightning-services." >&2
   exit 1
 fi
 MYSQL_BIN_DIR="$MYSQL_BASE/bin/$ARCH_DIR/bin"
+if [[ ! -d "$MYSQL_BIN_DIR" ]]; then
+  echo "Error: $DB_ENGINE binaries not found at $MYSQL_BIN_DIR" >&2
+  echo "Open the site once in Local so it downloads the database service." >&2
+  exit 1
+fi
 
 # ── Site-specific php.ini ─────────────────────────────────────────────
 
